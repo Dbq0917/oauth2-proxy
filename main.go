@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/validation"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/version"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/watcher"
 	"github.com/spf13/pflag"
 	"go.yaml.in/yaml/v4"
 )
@@ -73,8 +75,57 @@ func main() {
 		logger.Fatalf("ERROR: Failed to initialise OAuth2 Proxy: %v", err)
 	}
 
+	watchUpstreamConfig(*config, *alphaConfig, configFlagSet, os.Args[1:], oauthproxy)
+
 	if err := oauthproxy.Start(); err != nil {
 		logger.Fatalf("ERROR: Failed to start OAuth2 Proxy: %v", err)
+	}
+}
+
+// watchUpstreamConfig reloads the upstream configuration from the configuration
+// files whenever they change on disk. The whole options file is re-parsed using
+// the exact same loading path and configuration format as at startup, but only
+// the upstream section is hot applied. Any parse, validation or reachability
+// failure is logged by the DynamicProxy and leaves the running configuration
+// untouched, so a bad write can never break the serving proxy.
+func watchUpstreamConfig(config, alphaConfig string, extraFlags *pflag.FlagSet, args []string, proxy *OAuthProxy) {
+	if config == "" && alphaConfig == "" {
+		return
+	}
+
+	reload := func() {
+		reloaded, err := loadConfiguration(config, alphaConfig, extraFlags, args)
+		if err != nil {
+			logger.Errorf("upstream reload skipped: failed to reload configuration file, keeping current configuration: %v", err)
+			return
+		}
+		// Only the upstream section is hot applied, so restrict validation to
+		// it. Full Options validation also covers flags supplied on the
+		// command line, which are intentionally absent from a re-parse of the
+		// configuration files and would produce false positives.
+		if len(reloaded.UpstreamServers.Upstreams) == 0 {
+			logger.Errorf("upstream reload skipped: reloaded configuration contains no upstreams, keeping current configuration (the file may still be being written)")
+			return
+		}
+		if msgs := validation.ValidateUpstreams(reloaded.UpstreamServers); len(msgs) > 0 {
+			logger.Errorf("upstream reload skipped: reloaded upstream configuration is invalid, keeping current configuration: %s", strings.Join(msgs, "; "))
+			return
+		}
+		if err := proxy.ReloadUpstreams(reloaded.UpstreamServers); err != nil {
+			// The DynamicProxy already logs the detailed rejection reason.
+			logger.Errorf("upstream reload failed, current configuration kept: %v", err)
+		}
+	}
+
+	if config != "" {
+		if err := watcher.WatchFileForUpdates(config, nil, reload); err != nil {
+			logger.Errorf("failed to watch configuration file %q for upstream reloads: %v", config, err)
+		}
+	}
+	if alphaConfig != "" {
+		if err := watcher.WatchFileForUpdates(alphaConfig, nil, reload); err != nil {
+			logger.Errorf("failed to watch alpha configuration file %q for upstream reloads: %v", alphaConfig, err)
+		}
 	}
 }
 

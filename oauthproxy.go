@@ -113,7 +113,7 @@ type OAuthProxy struct {
 	preAuthChain      alice.Chain
 	pageWriter        pagewriter.Writer
 	server            proxyhttp.Server
-	upstreamProxy     http.Handler
+	upstreamProxy     *upstream.DynamicProxy
 	serveMux          *mux.Router
 	redirectValidator redirect.Validator
 	appDirector       redirect.AppDirector
@@ -158,7 +158,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		return nil, fmt.Errorf("error initialising page writer: %v", err)
 	}
 
-	upstreamProxy, err := upstream.NewProxy(opts.UpstreamServers, opts.GetSignatureData(), pageWriter)
+	upstreamProxy, err := upstream.NewDynamicProxy(opts.UpstreamServers, opts.GetSignatureData(), pageWriter)
 	if err != nil {
 		return nil, fmt.Errorf("error initialising upstream proxy: %v", err)
 	}
@@ -275,13 +275,38 @@ func (p *OAuthProxy) Start() error {
 
 	// Observe signals in background goroutine.
 	go func() {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
-		<-sigint
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1)
+		for sig := range signals {
+			if sig == syscall.SIGUSR1 {
+				// SIGUSR1 is the one-click rollback trigger: restore the
+				// previous upstream configuration without editing files or
+				// restarting the process.
+				if err := p.RollbackUpstreams(); err != nil {
+					logger.Errorf("upstream rollback triggered by SIGUSR1 failed: %v", err)
+				}
+				continue
+			}
+			break
+		}
 		cancel() // cancel the context
 	}()
 
 	return p.server.Start(ctx)
+}
+
+// ReloadUpstreams swaps the running proxy to the given upstream configuration.
+// Invalid or unreachable configurations are rejected inside the DynamicProxy,
+// leaving the currently active configuration untouched.
+func (p *OAuthProxy) ReloadUpstreams(config options.UpstreamConfig) error {
+	return p.upstreamProxy.Reload(config)
+}
+
+// RollbackUpstreams restores the upstream configuration that was active before
+// the last successful reload. It can also be triggered by sending SIGUSR1 to
+// the process.
+func (p *OAuthProxy) RollbackUpstreams() error {
+	return p.upstreamProxy.Rollback()
 }
 
 func (p *OAuthProxy) setupServer(opts *options.Options) error {

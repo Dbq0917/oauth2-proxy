@@ -21,6 +21,15 @@ func validateUpstreams(upstreams options.UpstreamConfig) []string {
 	return msgs
 }
 
+// ValidateUpstreams validates the given upstream configuration and returns
+// human readable messages describing every problem found.
+// It exposes the upstream portion of the startup validation so that it can be
+// reused when reloading upstream configuration at runtime, guaranteeing that a
+// hot reload applies exactly the same rules as a process start.
+func ValidateUpstreams(upstreams options.UpstreamConfig) []string {
+	return validateUpstreams(upstreams)
+}
+
 // validateUpstream validates that the upstream has valid options and that
 // the ids and paths are unique across all options
 func validateUpstream(upstream options.Upstream, ids, paths map[string]struct{}) []string {
